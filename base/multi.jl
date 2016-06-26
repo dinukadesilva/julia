@@ -57,7 +57,7 @@ end
 # Used instead of Nullable to decrease wire size of header.
 null_id(id) =  id == RRID(0, 0)
 
-type CallMsg{Mode} <: AbstractMsg
+immutable CallMsg{Mode} <: AbstractMsg
     f::Function
     args::Tuple
     kwargs::Array
@@ -94,6 +94,41 @@ end
 immutable JoinCompleteMsg <: AbstractMsg
     cpu_cores::Int
     ospid::Int
+end
+
+# Avoiding serializing AbstractMsg containers results in a speedup
+# of approximately 10%. Can be removed once module Serializer
+# has been suitably improved.
+
+# replace  CallMsg{Mode} with specific invocations
+const msgtypes = filter!(x->x!=CallMsg, subtypes(AbstractMsg))
+push!(msgtypes, CallMsg{:call}, CallMsg{:call_fetch})
+
+for (idx, tname) in enumerate(msgtypes)
+    nflds = length(fieldnames(tname))
+    @eval begin
+        function serialize(s::AbstractSerializer, o::$tname)
+            write(s.io, UInt8($idx))
+            for fld in fieldnames($tname)
+                serialize(s, getfield(o, fld))
+            end
+        end
+    end
+    @eval begin
+        function deserialize_msg(s::AbstractSerializer, ::Type{$tname})
+            data=Array(Any, $nflds)
+            for i in 1:$nflds
+                data[i] = deserialize(s)
+            end
+            return $tname(data...)
+        end
+    end
+end
+
+function deserialize_msg(s)
+    idx = read(s.io, UInt8)
+    t = msgtypes[idx]
+    return deserialize_msg(s, t)
 end
 
 function send_msg_unknown(s::IO, header, msg)
@@ -262,19 +297,15 @@ end
 # A size of 10 bytes indicates ~ ~1e24 possible boundaries, so chance of collision with message contents is trivial.
 const MSG_BOUNDARY = UInt8[0x79, 0x8e, 0x8e, 0xf5, 0x6e, 0x9b, 0x2e, 0x97, 0xd5, 0x7d]
 
+# Faster serialization/deserialization of MsgHeader and RRID
 function serialize_hdr_raw(io, hdr)
-    write(io, hdr.response_oid.whence)
-    write(io, hdr.response_oid.id)
-    write(io, hdr.notify_oid.whence)
-    write(io, hdr.notify_oid.id)
+    write(io, hdr.response_oid.whence, hdr.response_oid.id, hdr.notify_oid.whence, hdr.notify_oid.id)
 end
 
 function deserialize_hdr_raw(io)
-    rid_whence = read(io, Int)
-    rid_id = read(io, Int)
-    nid_whence = read(io, Int)
-    nid_id = read(io, Int)
-    return MsgHeader(RRID(rid_whence, rid_id), RRID(nid_whence, nid_id))
+    data = Array(Int, 4)
+    read!(io, data)
+    return MsgHeader(RRID(data[1], data[2]), RRID(data[3], data[4]))
 end
 
 function send_msg_(w::Worker, header, msg, now::Bool)
@@ -1040,7 +1071,7 @@ function message_handler_loop(r_stream::IO, w_stream::IO, incoming::Bool)
 
         # The first message will associate wpid with r_stream
         msghdr = deserialize_hdr_raw(r_stream)
-        msg = deserialize(serializer)
+        msg = deserialize_msg(serializer)
         readbytes!(r_stream, boundary, length(MSG_BOUNDARY))
 
         handle_msg(msg, msghdr, r_stream, w_stream, version)
@@ -1051,10 +1082,10 @@ function message_handler_loop(r_stream::IO, w_stream::IO, incoming::Bool)
         while true
             reset_state(serializer)
             msghdr = deserialize_hdr_raw(r_stream)
-#            println("msghdr: ", msghdr)
+            # println("msghdr: ", msghdr)
 
             try
-                msg = deserialize(serializer)
+                msg = deserialize_msg(serializer)
             catch e
                 # Deserialization error; discard bytes in stream until boundary found
                 boundary_idx = 1
@@ -1071,8 +1102,8 @@ function message_handler_loop(r_stream::IO, w_stream::IO, incoming::Bool)
                         boundary_idx = 1
                     end
                 end
- #               println("Deserialization error.")
                 remote_err = RemoteException(myid(), CapturedException(e, catch_backtrace()))
+                # println("Deserialization error. ", remote_err)
                 if !null_id(msghdr.response_oid)
                     ref = lookup_ref(msghdr.response_oid)
                     put!(ref, remote_err)
@@ -1084,7 +1115,7 @@ function message_handler_loop(r_stream::IO, w_stream::IO, incoming::Bool)
             end
             readbytes!(r_stream, boundary, length(MSG_BOUNDARY))
 
-  #          println("got msg: ", typeof(msg))
+            # println("got msg: ", typeof(msg))
             handle_msg(msg, msghdr, r_stream, w_stream, version)
         end
     catch e
